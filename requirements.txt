@@ -1,0 +1,6 @@
+httpx>=0.27
+python-dotenv>=1.0
+psycopg2-binary>=2.9
+sshtunnel>=0.4
+# sshtunnel 0.4 uses paramiko.DSSKey, removed in paramiko 4
+paramiko<4

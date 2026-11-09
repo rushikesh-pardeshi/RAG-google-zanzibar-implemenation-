@@ -1,0 +1,121 @@
+# OpenFGA + Postgres + monitoring (Prometheus, Grafana, cAdvisor, Postgres exporter)
+#
+#   docker compose up -d
+#
+# URLs:  OpenFGA API  http://localhost:8080      OpenFGA Playground http://localhost:3000
+#        Grafana      http://localhost:3001      (no login, dashboard opens by default)
+#        Prometheus   http://localhost:9090
+#
+# Host ports can be changed if busy: FGA_PORT, PLAYGROUND_PORT, GRAFANA_PORT, PROM_PORT, CADVISOR_PORT
+#
+# Resource limits (so "one instance" is a fixed size). Override with env vars, e.g.
+#   FGA_CPUS=4 PG_CPUS=4 docker compose up -d
+services:
+  postgres:
+    image: postgres:16
+    container_name: fga-postgres
+    environment: { POSTGRES_USER: fga, POSTGRES_PASSWORD: fga, POSTGRES_DB: fga }
+    volumes:
+      - fga_pgdata:/var/lib/postgresql/data
+    cpus: ${PG_CPUS:-2}
+    mem_limit: ${PG_MEM:-4g}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fga -d fga"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    image: openfga/openfga
+    container_name: fga-migrate
+    command: migrate --datastore-engine postgres
+    environment:
+      OPENFGA_DATASTORE_URI: ${OPENFGA_DATASTORE_URI:-postgres://fga:fga@postgres:5432/fga}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  openfga:
+    image: openfga/openfga
+    container_name: fga-openfga
+    command: run
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: ${OPENFGA_DATASTORE_URI:-postgres://fga:fga@postgres:5432/fga}
+      # metrics for the dashboard
+      OPENFGA_METRICS_ENABLED: "true"
+      OPENFGA_METRICS_ADDR: "0.0.0.0:2112"
+      OPENFGA_METRICS_ENABLE_RPC_HISTOGRAMS: "true"   # latency histograms (a bit more memory)
+      OPENFGA_DATASTORE_METRICS_ENABLED: "true"       # Postgres pool metrics
+      # tuning knobs for experiments (defaults = OpenFGA defaults)
+      OPENFGA_DATASTORE_MAX_OPEN_CONNS: ${FGA_DB_MAX_OPEN_CONNS:-30}
+      OPENFGA_DATASTORE_MAX_IDLE_CONNS: ${FGA_DB_MAX_IDLE_CONNS:-10}
+      OPENFGA_CHECK_QUERY_CACHE_ENABLED: ${FGA_CHECK_CACHE:-false}
+      OPENFGA_CHECK_ITERATOR_CACHE_ENABLED: ${FGA_CHECK_CACHE:-false}
+      OPENFGA_CHECK_QUERY_CACHE_TTL: ${FGA_CHECK_CACHE_TTL:-10s}
+      OPENFGA_REQUEST_TIMEOUT: ${FGA_REQUEST_TIMEOUT:-3s}
+      GOMAXPROCS: ${FGA_CPUS:-2}   # match the CPU limit to avoid cgroup throttling (FGA_CPUS must be a whole number)
+    ports:
+      - "${FGA_PORT:-8080}:8080"          # HTTP API
+      - "${PLAYGROUND_PORT:-3000}:3000"   # Playground
+    cpus: ${FGA_CPUS:-2}
+    mem_limit: ${FGA_MEM:-2g}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter
+    container_name: fga-pg-exporter
+    environment:
+      DATA_SOURCE_NAME: ${OPENFGA_DATASTORE_URI:-postgresql://fga:fga@postgres:5432/fga?sslmode=disable}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: fga-cadvisor
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - "${CADVISOR_PORT:-8082}:8080"
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fga-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver   # lets k6 push its metrics here
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "${PROM_PORT:-9090}:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: fga-grafana
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin      # local testing only: no login
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/openfga-capacity.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  fga_pgdata:
+  prom_data:
+  grafana_data:

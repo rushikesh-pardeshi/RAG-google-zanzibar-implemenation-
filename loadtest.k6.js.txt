@@ -1,0 +1,94 @@
+// k6 capacity test: how many RAG queries/sec can ONE OpenFGA + ONE Postgres handle?
+//
+// Each iteration = one simulated user query = one batch-check of 50 unique docs
+// (one "query" ~ 1 HTTP request; a real query with 100 chunks may need 2 of these).
+//
+// Run from the kit folder (needs state.json created by seed.py):
+//   k6 run loadtest.k6.js
+// Or pass ids explicitly:
+//   k6 run -e STORE_ID=... -e MODEL_ID=... -e DOCS=200000 -e USERS=1000 loadtest.k6.js
+// Other options:
+//   -e BASE_URL=http://host:8080   -e MODE=check   -e MAX_RATE=2000   -e P95_MS=200
+import http from 'k6/http';
+import { check } from 'k6';
+import { Trend, Counter } from 'k6/metrics';
+
+let state = {};
+try { state = JSON.parse(open('./state.json')); } catch (e) { /* use -e vars */ }
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
+const STORE_ID = __ENV.STORE_ID || state.store_id;
+const MODEL_ID = __ENV.MODEL_ID || state.model_id;
+const DOCS = parseInt(__ENV.DOCS || state.docs || '200000');
+const USERS = parseInt(__ENV.USERS || state.users || '1000');
+const MODE = __ENV.MODE || 'batch';          // batch | check
+const MAX_RATE = parseInt(__ENV.MAX_RATE || '2000');
+const P95_MS = parseInt(__ENV.P95_MS || '200');
+const CHECKS_PER_REQ = 50;                    // default server batch limit
+
+const fgaLatency = new Trend('fga_latency_ms', true);
+const fgaErrors = new Counter('fga_errors');
+
+// Open model: k6 fires N iterations/sec regardless of how slow the server gets,
+// which is what real traffic does. The test aborts at the first sign of overload.
+export const options = {
+  scenarios: {
+    ramp: {
+      executor: 'ramping-arrival-rate',
+      startRate: 10,
+      timeUnit: '1s',
+      preAllocatedVUs: 200,
+      maxVUs: 5000,
+      stages: [
+        { target: Math.round(MAX_RATE * 0.05), duration: '1m' },  // warm-up
+        { target: Math.round(MAX_RATE * 0.25), duration: '2m' },
+        { target: Math.round(MAX_RATE * 0.50), duration: '2m' },
+        { target: Math.round(MAX_RATE * 0.75), duration: '2m' },
+        { target: MAX_RATE,                    duration: '2m' },
+        { target: MAX_RATE,                    duration: '2m' },  // hold at peak
+      ],
+    },
+  },
+  thresholds: {
+    // stop the run as soon as these are broken: that's your breaking point
+    http_req_failed: [{ threshold: 'rate<0.01', abortOnFail: true, delayAbortEval: '30s' }],
+    http_req_duration: [{ threshold: `p(95)<${P95_MS}`, abortOnFail: true, delayAbortEval: '30s' }],
+  },
+};
+
+function randDoc() { return `document:d${Math.floor(Math.random() * DOCS)}`; }
+
+export default function () {
+  const user = `user:u${Math.floor(Math.random() * USERS)}`;
+  let res;
+  if (MODE === 'batch') {
+    const checks = [];
+    const seen = new Set();
+    while (checks.length < CHECKS_PER_REQ) {
+      const obj = randDoc();
+      if (seen.has(obj)) continue;
+      seen.add(obj);
+      checks.push({
+        tuple_key: { user, relation: 'viewer', object: obj },
+        correlation_id: obj.replace('document:', ''),
+      });
+    }
+    res = http.post(
+      `${BASE_URL}/stores/${STORE_ID}/batch-check`,
+      JSON.stringify({ checks, authorization_model_id: MODEL_ID }),
+      { headers: { 'Content-Type': 'application/json' } },
+    );
+  } else {
+    res = http.post(
+      `${BASE_URL}/stores/${STORE_ID}/check`,
+      JSON.stringify({
+        tuple_key: { user, relation: 'viewer', object: randDoc() },
+        authorization_model_id: MODEL_ID,
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    );
+  }
+  fgaLatency.add(res.timings.duration);
+  const ok = check(res, { 'status 200': (r) => r.status === 200 });
+  if (!ok) fgaErrors.add(1);
+}
